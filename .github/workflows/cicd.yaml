@@ -6,19 +6,16 @@ on:
       - main
     paths-ignore:
       - "README.md"
+
   workflow_dispatch:
 
-# Avoid overlapping production deployments.
+# Serialize production deployments.
 concurrency:
   group: agentic-chatbot-production
   cancel-in-progress: false
 
 permissions:
   contents: read
-
-env:
-  STREAMLIT_PORT: "8501"
-  CONTAINER_NAME: stapp
 
 jobs:
   # ============================================================
@@ -35,7 +32,6 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          # Keep this aligned with the Python version in your Dockerfile.
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements.txt
@@ -49,22 +45,12 @@ jobs:
         run: python -m compileall -q .
 
       - name: Lint Python files
-        run: |
-          # Ruff may flag existing style issues. Fix them or configure
-          # project rules in pyproject.toml rather than skipping CI.
-          ruff check .
+        run: ruff check .
 
       - name: Run unit tests
         run: |
-          if find . -type f -name 'test_*.py' \
-              -not -path './.git/*' \
-              -not -path './.venv/*' \
-              -print -quit | grep -q .; then
-            python -m pip install -r requirements.txt
-            python -m pytest -q
-          else
-            echo "No test_*.py files found; add unit tests to enable this check."
-          fi
+          python -m pip install -r requirements.txt
+          python -m pytest -q
 
   # ============================================================
   # 2. BUILD AND PUSH IMAGE TO DOCKER HUB
@@ -84,20 +70,24 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
         run: |
+          set -eu
+
           test -n "$DOCKER_USERNAME" || {
-            echo "::error::DOCKER_USERNAME secret is missing."
-            exit 1
-          }
-          test -n "$DOCKER_PASSWORD" || {
-            echo "::error::DOCKER_PASSWORD secret is missing."
-            exit 1
-          }
-          test -n "$IMAGE_NAME" || {
-            echo "::error::IMAGE_NAME secret is missing."
+            echo "::error::DOCKER_USERNAME is missing."
             exit 1
           }
 
-          echo "Docker Hub secrets are present."
+          test -n "$DOCKER_PASSWORD" || {
+            echo "::error::DOCKER_PASSWORD is missing."
+            exit 1
+          }
+
+          test -n "$IMAGE_NAME" || {
+            echo "::error::IMAGE_NAME is missing."
+            exit 1
+          }
+
+          echo "Docker Hub secrets are configured."
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -121,14 +111,12 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ============================================================
-  # 3. DEPLOY TO AWS EC2 SELF-HOSTED RUNNER
+  # 3. DEPLOY TO AWS EC2
   # ============================================================
   continuous_deployment:
     name: Deploy to AWS EC2
     needs: push_to_registry
     runs-on: self-hosted
-    # Optional: configure a GitHub Environment named "production"
-    # and move deployment secrets to that environment if desired.
 
     steps:
       - name: Validate deployment secrets
@@ -142,8 +130,14 @@ jobs:
         run: |
           set -eu
 
-          for name in DOCKER_USERNAME DOCKER_PASSWORD IMAGE_NAME \
-                      GOOGLE_API_KEY TAVILY_API_KEY OPENWEATHER_API_KEY; do
+          for name in \
+            DOCKER_USERNAME \
+            DOCKER_PASSWORD \
+            IMAGE_NAME \
+            GOOGLE_API_KEY \
+            TAVILY_API_KEY \
+            OPENWEATHER_API_KEY
+          do
             eval 'value=${'${name}':-}'
             if [ -z "$value" ]; then
               echo "::error::$name secret is missing."
@@ -151,9 +145,9 @@ jobs:
             fi
           done
 
-          echo "Required deployment secrets are present."
+          echo "Required deployment secrets are configured."
 
-      - name: Log in to Docker Hub on EC2 runner
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -167,7 +161,7 @@ jobs:
           set -eu
           docker pull "${IMAGE_PATH}:${IMAGE_TAG}"
 
-      - name: Deploy container and roll back on failure
+      - name: Deploy and verify application
         env:
           IMAGE_PATH: ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}
           IMAGE_TAG: sha-${{ github.sha }}
@@ -181,6 +175,7 @@ jobs:
           LANGSMITH_ENDPOINT: ${{ secrets.LANGSMITH_ENDPOINT }}
           LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
           LANGSMITH_PROJECT: ${{ secrets.LANGSMITH_PROJECT }}
+
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -188,18 +183,15 @@ jobs:
           NEW_IMAGE="${IMAGE_PATH}:${IMAGE_TAG}"
           OLD_IMAGE=""
 
-          # Save the old container image reference for a basic rollback.
+          # Record the previous image before replacing the container.
           if docker container inspect stapp >/dev/null 2>&1; then
-            OLD_IMAGE="$(docker inspect --format='{{.Config.Image}}' stapp)"
+            OLD_IMAGE="$(docker inspect \
+              --format='{{.Config.Image}}' stapp)"
           fi
-
-          # Preserve an existing container's mounts and environment only
-          # if they are explicitly configured in your deployment process.
-          # Add your real persistent volume mounts to docker run below.
-          docker rm -f stapp 2>/dev/null || true
 
           start_container() {
             local image="$1"
+
             docker run -d \
               --restart unless-stopped \
               --name stapp \
@@ -216,24 +208,29 @@ jobs:
           }
 
           rollback() {
-            echo "::error::New deployment failed. Attempting rollback."
+            echo "Attempting rollback to the previous image."
             docker rm -f stapp 2>/dev/null || true
 
-            if [ -n "$OLD_IMAGE" ]; then
-              if docker image inspect "$OLD_IMAGE" >/dev/null 2>&1; then
-                start_container "$OLD_IMAGE" || true
-                echo "Rollback attempted using: $OLD_IMAGE"
+            if [ -n "$OLD_IMAGE" ] && \
+               docker image inspect "$OLD_IMAGE" >/dev/null 2>&1; then
+              if start_container "$OLD_IMAGE"; then
+                echo "Previous image restarted: $OLD_IMAGE"
               else
-                echo "Previous image is not present locally; rollback unavailable."
+                echo "::error::Rollback container could not start."
               fi
             else
-              echo "No previous container image was found to roll back to."
+              echo "::warning::No previous local image is available for rollback."
             fi
           }
 
-          start_container "$NEW_IMAGE"
+          # Start the new image. Roll back if startup fails.
+          if ! start_container "$NEW_IMAGE"; then
+            echo "::error::New container failed to start."
+            rollback
+            exit 1
+          fi
 
-          # Wait for Streamlit to report healthy before accepting deployment.
+          # Wait for Streamlit's health endpoint.
           for attempt in $(seq 1 24); do
             if docker exec stapp python -c \
               "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5)" \
@@ -250,7 +247,7 @@ jobs:
               break
             fi
 
-            echo "Waiting for Streamlit health check ($attempt/24)..."
+            echo "Waiting for Streamlit ($attempt/24)..."
             sleep 5
           done
 
