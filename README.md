@@ -1,4 +1,4 @@
-# Agentic Chatbot --- End-to-End CI/CD Deployment on AWS EC2
+# Agentic AI Chabot with RAG, HITL & CI/CD Deployment on AWS EC2 
 
 An end-to-end guide for running a Streamlit-based agentic chatbot
 locally and deploying it with Docker, Docker Hub, GitHub Actions, and an
