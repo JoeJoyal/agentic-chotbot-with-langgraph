@@ -833,8 +833,3 @@ image publishing, and EC2 deployment:
 
 **Git push → CI → Docker build → Docker Hub push → EC2 pull → container
 launch → health check → rollback attempt if needed.**
-
-Treat this README as a project guide and verify filenames, integrations,
-environment variables, and data paths against the repository before
-using it as a production runbook.
-# agentic-chotbot-with-langgraph
